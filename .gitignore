@@ -1,0 +1,13 @@
+# Mac/Windows 시스템 파일 무시
+.DS_Store
+Thumbs.db
+
+# QuPath 백업 및 임시 파일 무시
+*.bak
+*.tmp
+
+# (선택사항) 용량이 큰 이미지 파일은 제외하고 코드만 올리고 싶다면 아래 추가
+*.svs
+*.tiff
+*.vsi
+*.mrxs
