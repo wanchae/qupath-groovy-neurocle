@@ -10,6 +10,13 @@ import qupath.lib.roi.interfaces.ROI;
 import qupath.lib.roi.ROIs;
 import qupath.lib.roi.RoiTools;
 import qupath.lib.regions.RegionRequest;
+
+// JTS Geometry (Used for stable outline extraction)
+import org.locationtech.jts.geom.Geometry;
+import org.locationtech.jts.geom.Polygon;
+import org.locationtech.jts.geom.GeometryCollection;
+import org.locationtech.jts.geom.Coordinate;
+
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.nio.file.Files;
@@ -19,15 +26,13 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
-import java.awt.Shape;
-import java.awt.geom.PathIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import groovy.transform.Field
 import javax.imageio.ImageIO;
 
 // ================================================================
-// DATA GENERATOR FOR MODEL-GENERATED ANNOTATIONS (Sparse Export Mode)
+// DATA GENERATOR (Solid Polygons / Fill Holes)
 // ================================================================
 // 1) outputFolderName: Output folder name (created under QuPath project directory)
 // 2) datasetName: Dataset name - used for folder structure and JSON filename
@@ -36,8 +41,7 @@ import javax.imageio.ImageIO;
 // 4) Target class names to extract
 //  # If datasetName == className, operates in self-referencing mode
 
-
-@Field String outputFolderName = "tumor_dataset_AOV_ST_COL_v01_ROI2_Optimized"  
+@Field String outputFolderName = "tumor_dataset_AOV_ST_COL_v01_ROI2_Solid_0002"  
 @Field String datasetName = "ROI"
 @Field String modelType = "SEG"
 @Field ArrayList<String> classNames = new ArrayList<>(Arrays.asList("ADE","Gland"))
@@ -54,11 +58,12 @@ import javax.imageio.ImageIO;
 @Field double downsample = 4.0
 @Field int patchSize = 512
 @Field int overlap = 32
-@Field boolean annotatedTilesOnly = true // 어노테이션이 있는 타일만 저장
+@Field boolean annotatedTilesOnly = true
 
 // ================================================================
 // FILTERING SETTINGS
 // ================================================================
+
 // 1) Enable ROI-based filtering
 //  # When true, only tiles within ROI annotations are extracted
 //  # ROI annotations must have Classification matching datasetName
@@ -66,17 +71,20 @@ import javax.imageio.ImageIO;
 //  # true: Exclude tiles that touch ROI boundary
 //  # false: Include tiles that overlap with ROI
 
+
 @Field boolean enableROIFiltering = true
 @Field boolean strictROIBoundary = true
 
 // ================================================================
 // TISSUE QUALITY FILTERING SETTINGS
 // ================================================================
+
 // 1) Enable tissue quality filtering to remove background/glass regions
 // 2) glassThreshold: Background detection threshold (0-255)
 //  # Higher values detect more background
 // 3) percentageThreshold: Minimum tissue percentage required to keep a tile (0.0-1.0)
 //  # Tiles with less tissue are discarded
+
 
 @Field boolean enableTissueFiltering = true
 @Field double glassThreshold = 50
@@ -150,7 +158,9 @@ public class DataGenerator {
     private Collection<PathObject> roiAnnotations = new ArrayList<>();
 
     private Path dbPath;
-    private Gson gson = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    
+    // JSON Size Optimization (Removing Whitespace)
+    private Gson gson = new GsonBuilder().disableHtmlEscaping().create();
     
     private Map<String, TileData> groupedAnnotations = new ConcurrentHashMap<>();
     
@@ -159,7 +169,6 @@ public class DataGenerator {
     private AtomicInteger totalTilesProcessed = new AtomicInteger(0);
     private AtomicInteger tilesSaved = new AtomicInteger(0);
 
-    // Tissue Mask Caching
     private int[] tissueMaskPixels;
     private int maskWidth;
     private int maskHeight;
@@ -185,7 +194,6 @@ public class DataGenerator {
         this.dbPath = Paths.get(projectBasePath, datasetName);
         Collection<PathObject> allObjects = imageData.getHierarchy().getAnnotationObjects();
         
-        // Setup Filter Lists
         boolean isSelfReferencing = classNames.contains(datasetName);
         if (isSelfReferencing) {
             for (PathObject annotation : allObjects) {
@@ -225,15 +233,12 @@ public class DataGenerator {
             return;
         }
         
-        // 1. Prepare Mask
         if (enableTissueFiltering) {
             prepareTissueMask();
         }
 
-        // 2. Export Tiles Manually (Sparse)
         exportSparseTiles();
         
-        // 3. Save Metadata
         saveJson();
         printStatistics();
     }
@@ -246,7 +251,6 @@ public class DataGenerator {
             requestDownsample = Math.min(requestDownsample, 64.0); 
 
             RegionRequest request = RegionRequest.createInstance(server.getPath(), requestDownsample, 0, 0, server.getWidth(), server.getHeight());
-            // [Fix] Deprecation Warning: readBufferedImage -> readRegion
             BufferedImage img = server.readRegion(request);
             
             this.maskWidth = img.getWidth();
@@ -261,7 +265,6 @@ public class DataGenerator {
         }
     }
 
-    // [핵심 변경] TileExporter를 사용하지 않고 직접 타일을 계산하여 저장
     private void exportSparseTiles() {
         File processedDir = new File(dbPath.toString(), "images");
         if (!processedDir.exists()) processedDir.mkdirs();
@@ -269,13 +272,11 @@ public class DataGenerator {
         int serverWidth = server.getWidth();
         int serverHeight = server.getHeight();
         
-        // Level 0 기준 사이즈 계산
         double regionSize = patchSize * downsample;
         double stepSize = (patchSize - overlap) * downsample;
         
         List<Point2> potentialTiles = new ArrayList<>();
         
-        // 타일 그리드 생성
         for (double y = 0; y + regionSize <= serverHeight; y += stepSize) {
             for (double x = 0; x + regionSize <= serverWidth; x += stepSize) {
                 potentialTiles.add(new Point2(x, y));
@@ -284,7 +285,6 @@ public class DataGenerator {
         
         totalTilesProcessed.set(potentialTiles.size());
         
-        // 병렬 처리
         potentialTiles.parallelStream().forEach(point -> {
             int x = (int) point.getX();
             int y = (int) point.getY();
@@ -300,19 +300,17 @@ public class DataGenerator {
     }
 
     private void processSingleTile(int x, int y, int w, int h, File processedDir) {
-        // 1. Tissue Check (Fastest, In-Memory)
         if (enableTissueFiltering && !checkTissueInMask(x, y, w, h)) return;
         
         ROI tileROI = ROIs.createRectangleROI(x, y, w, h, null);
         
-        // 2. ROI Filtering (Dataset ROI, e.g. Tumor Bed)
+        // ROI Filtering
         if (enableROIFiltering) {
             boolean isInsideROI = false;
             for (PathObject roiAnnotation : roiAnnotations) {
                 ROI roiGeometry = roiAnnotation.getROI();
                 if (roiGeometry == null || !roiGeometry.isArea()) continue;
 
-                // Bounding Box Check first
                 if (!roiGeometry.getShape().getBounds().intersects(x, y, w, h)) continue;
 
                 if (strictROIBoundary) {
@@ -328,7 +326,6 @@ public class DataGenerator {
             if (!isInsideROI) return;
         }
         
-        // 3. Target Annotation Check & Label Generation
         List<RegionLabel> regionLabels = new ArrayList<>();
         Map<String, Double> classAreaMap = new HashMap<>();
         boolean hasTargetAnnotation = false;
@@ -337,70 +334,48 @@ public class DataGenerator {
             ROI roi = annotation.getROI();
             if (roi == null || !roi.isArea()) continue;
             
-            // Bounding Box Check
             if (!roi.getShape().getBounds().intersects(x, y, w, h)) continue;
             
             ROI intersectionROI = RoiTools.intersection(Arrays.asList(roi, tileROI));
             if (intersectionROI == null || intersectionROI.isEmpty() || !intersectionROI.isArea()) continue;
             
-            hasTargetAnnotation = true; // Found at least one target
+            hasTargetAnnotation = true;
             String className = annotation.getPathClass() != null ? annotation.getPathClass().getName() : "Unknown";
 
             if (modelType.equals("SEG")) {
                 try {
-                    Shape shape = intersectionROI.getShape();
-                    PathIterator pi = shape.getPathIterator(null, 0.5); 
-                    List<List<Integer>> currentPolyPoints = new ArrayList<>();
-                    double[] coords = new double[6];
-                    while (!pi.isDone()) {
-                        int type = pi.currentSegment(coords);
-                        int px = (int)((coords[0] - x) / downsample);
-                        int py = (int)((coords[1] - y) / downsample);
-                        px = Math.max(0, Math.min(patchSize, px));
-                        py = Math.max(0, Math.min(patchSize, py));
-
-                        if (type == PathIterator.SEG_MOVETO) {
-                            if (!currentPolyPoints.isEmpty() && currentPolyPoints.size() > 2)
-                                regionLabels.add(new RegionLabel(className, "PolyGon", new ArrayList<>(currentPolyPoints)));
-                            currentPolyPoints.clear();
-                            currentPolyPoints.add(Arrays.asList(px, py));
-                        } else if (type == PathIterator.SEG_LINETO) {
-                            currentPolyPoints.add(Arrays.asList(px, py));
-                        } else if (type == PathIterator.SEG_CLOSE) {
-                            if (!currentPolyPoints.isEmpty() && currentPolyPoints.size() > 2)
-                                regionLabels.add(new RegionLabel(className, "PolyGon", new ArrayList<>(currentPolyPoints)));
-                            currentPolyPoints.clear();
-                        }
-                        pi.next();
+                    // Boldly disregard hole information and store only the exterior cleanly
+                    Geometry geom = intersectionROI.getGeometry();
+                    
+                    if (!geom.isValid()) {
+                        geom = geom.buffer(0);
                     }
-                    if (!currentPolyPoints.isEmpty() && currentPolyPoints.size() > 2)
-                        regionLabels.add(new RegionLabel(className, "PolyGon", new ArrayList<>(currentPolyPoints)));
-                } catch (Exception e) {}
+                    
+                    extractFilledPolygons(geom, x, y, className, regionLabels);
+                    
+                } catch (Exception e) {
+                    logger.error("Error extracting geometry for tile " + x + "," + y, e);
+                }
             } else if (modelType.equals("CLA")) {
                  classAreaMap.put(className, classAreaMap.getOrDefault(className, 0.0) + intersectionROI.getArea());
             }
         }
 
-        // annotatedTilesOnly=true 인데 타겟 어노테이션이 하나도 없으면 스킵
         if (annotatedTilesOnly && !hasTargetAnnotation) return;
 
-        // 4. Save Tile Image (Real I/O happens only here)
         String imageName = server.getMetadata().getName();
         String tileName = String.format("%s [d=%.0f,x=%d,y=%d,w=%d,h=%d]%s", 
                                         imageName.substring(0, imageName.lastIndexOf('.')), 
                                         downsample, x, y, w, h, imageExtension);
-        String saveName = tileName.split(Pattern.quote(imageExtension))[0] + ".png"; // .svs 등 제거 후 .png
+        String saveName = tileName.split(Pattern.quote(imageExtension))[0] + ".png";
 
-        // Create Request
         RegionRequest request = RegionRequest.createInstance(server.getPath(), downsample, x, y, w, h);
         try {
-            // [Fix] Deprecation Warning
             BufferedImage tileImage = server.readRegion(request);
             File outputFile = new File(processedDir, saveName);
             ImageIO.write(tileImage, "png", outputFile);
             tilesSaved.incrementAndGet();
             
-            // 5. Update JSON Data
             String tileClassLabel = "";
             if ("CLA".equals(modelType) && !classAreaMap.isEmpty()) {
                 tileClassLabel = classAreaMap.entrySet().stream()
@@ -419,6 +394,46 @@ public class DataGenerator {
         }
     }
     
+    // [Final: Solid Polygon] Logic that fills holes and saves only the outline
+    private void extractFilledPolygons(Geometry geom, int tileX, int tileY, String className, List<RegionLabel> regionLabels) {
+        if (geom instanceof Polygon) {
+            Polygon poly = (Polygon) geom;
+            
+            // Exterior Ring(Only the outline) is processed -> The interior is automatically filled
+            List<List<Integer>> shellPoints = convertCoordinates(poly.getExteriorRing().getCoordinates(), tileX, tileY);
+            if (shellPoints.size() > 2) {
+                // Unify the type to “PolyGon”
+                regionLabels.add(new RegionLabel(className, "PolyGon", shellPoints));
+            }
+            // Achieve the “Fill Hole” effect by removing the interior ring (hole) processing code
+            
+        } else if (geom instanceof GeometryCollection) {
+            for (int i = 0; i < geom.getNumGeometries(); i++) {
+                extractFilledPolygons(geom.getGeometryN(i), tileX, tileY, className, regionLabels);
+            }
+        }
+    }
+    
+    private List<List<Integer>> convertCoordinates(Coordinate[] coords, int tileX, int tileY) {
+        List<List<Integer>> points = new ArrayList<>();
+        for (Coordinate c : coords) {
+            int px = (int)((c.x - tileX) / downsample);
+            int py = (int)((c.y - tileY) / downsample);
+            
+            px = Math.max(0, Math.min(patchSize, px));
+            py = Math.max(0, Math.min(patchSize, py));
+            
+            // 중복 점 제거
+            if (!points.isEmpty()) {
+                List<Integer> last = points.get(points.size() - 1);
+                if (last.get(0) == px && last.get(1) == py) continue;
+            }
+            
+            points.add(Arrays.asList(px, py));
+        }
+        return points;
+    }
+
     private boolean checkTissueInMask(int tileX, int tileY, int tileW, int tileH) {
         if (tissueMaskPixels == null) return true; 
 
@@ -454,7 +469,7 @@ public class DataGenerator {
 
     private void printStatistics() {
         logger.info("=" * 60);
-        logger.info("TILE GENERATION STATISTICS (Sparse Export Mode)");
+        logger.info("TILE GENERATION STATISTICS (Final: Solid Polygons)");
         logger.info("Total potential tiles: {}", totalTilesProcessed.get());
         logger.info("Tiles actually saved: {}", tilesSaved.get());
         logger.info("Annotations Generated: {}", groupedAnnotations.size());
@@ -464,31 +479,17 @@ public class DataGenerator {
     public void saveJson() throws IOException {
         if (groupedAnnotations.isEmpty()) return;
         
-        String projectName = QPEx.getProject().getPath().getParent().getFileName().toString();
-        String jsonFileName = projectName + "_" + datasetName + "_output.json";
-        File outputFile = dbPath.resolve(jsonFileName).toFile();
+        String imageName = imageData.getServer().getMetadata().getName();
+        int dotIndex = imageName.lastIndexOf('.');
+        if (dotIndex > 0) imageName = imageName.substring(0, dotIndex);
         
-        Map<String, TileData> existingAnnotations = new HashMap<>();
-        if (outputFile.exists()) {
-            try (BufferedReader reader = new BufferedReader(new FileReader(outputFile))) {
-                Map<?, ?> parsedJson = gson.fromJson(reader, Map.class);
-                List<?> existingData = (List<?>) parsedJson.get("data");
-                if (existingData != null) {
-                    for (Object tileObj : existingData) {
-                        Map<?, ?> tileMap = (Map<?, ?>) tileObj;
-                        TileData tileData = gson.fromJson(gson.toJson(tileMap), TileData.class);
-                        existingAnnotations.put(tileData.fileName, tileData);
-                    }
-                }
-            } catch (Exception e) { logger.error("Error reading JSON", e); }
-        }
-
-        existingAnnotations.putAll(groupedAnnotations);
+        String jsonFileName = imageName + "_" + datasetName + "_output.json";
+        File outputFile = dbPath.resolve(jsonFileName).toFile();
         
         Map<String, Object> finalJson = new HashMap<>();
         finalJson.put("label_type", modelType);
         finalJson.put("source", "labelset");
-        finalJson.put("data", new ArrayList<>(existingAnnotations.values()));
+        finalJson.put("data", new ArrayList<>(groupedAnnotations.values()));
 
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(outputFile))) {
             writer.write(gson.toJson(finalJson));
@@ -498,7 +499,7 @@ public class DataGenerator {
 
     class RegionLabel {
         String className;
-        String type;
+        String type; 
         List<List<Integer>> points;
         int x, y, width, height;
         public RegionLabel(String className, String type, List<List<Integer>> points) {
